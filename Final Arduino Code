@@ -1,0 +1,417 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "Arduino_LED_Matrix.h"
+#include <WiFiS3.h>
+
+// WiFi Configuration
+char ssid[] = "realme 7";     // Your phone's hotspot name
+char pass[] = "g5qeemg4";    // Your phone's hotspot password
+WiFiServer server(80);
+
+// Pin assignments
+const int pulsePin = A0;
+const int tempPin = 2;
+#define BP_SERIAL Serial1
+
+// Temperature sensor setup
+OneWire oneWire(tempPin);
+DallasTemperature tempSensor(&oneWire);
+
+// LED Matrix
+ArduinoLEDMatrix matrix;
+const uint32_t heart[] = {0x3184a444, 0x44042081, 0x100a0040};
+const uint32_t cloud[] = {0x07E0F800, 0x1FF9FE00, 0x3FFFFFFF};
+bool readingsActive = false;
+unsigned long previousBlinkTime = 0;
+bool heartOn = false;
+unsigned long cloudDisplayTime = 0;
+bool showingCloud = false;
+
+// Pulse sensor variables
+const int pulseThreshold = 50;
+const int pulseMax = 1000;
+
+// Previous readings for comparison
+int prevBPM = 0;
+float prevTemp = 0.0;
+int prevSyst = 0;
+int prevDiast = 0;
+int prevBPPulse = 0;
+
+// Thresholds for considering a "change"
+const int BPM_THRESHOLD = 2;
+const float TEMP_THRESHOLD = 0.25;
+const int BP_THRESHOLD = 1;
+
+// Smoothing function variables
+const int numReadings = 10;
+int readings[numReadings] = {0};
+int readIndex = 0;
+
+// Global variables for data transmission
+String lastJsonData = "";
+
+// Function prototypes
+void parseBPData(String data, int &syst, int &diast, int &pulse);
+int smoothBPM(int rawBPM);
+void sendDataToClient(WiFiClient &client, const String &jsonData);
+void updateLEDMatrix(int syst, int diast, float temp, int bpm);
+void handleClient(WiFiClient &client);
+void reconnectWiFi();
+void showCloudAnimation();
+void showHeartAnimation();
+void broadcastData();
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+  BP_SERIAL.begin(9600);
+  tempSensor.begin();
+  tempSensor.setResolution(12);
+  matrix.begin();
+  
+  // Initialize WiFi
+  Serial.println("\n=== WiFi Connection Setup ===");
+  Serial.print("Connecting to phone hotspot: ");
+  Serial.println(ssid);
+  
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println("Communication with WiFi module failed!");
+    while (true);
+  }
+
+  reconnectWiFi();
+  
+  // Test LED matrix
+  Serial.println("Testing LED matrix...");
+  matrix.loadFrame(heart);
+  delay(1000);
+  matrix.loadFrame(cloud);
+  delay(1000);
+  matrix.clear();
+  Serial.println("LED matrix test complete");
+}
+
+void reconnectWiFi() {
+  int attempts = 0;
+  WiFi.begin(ssid, pass);
+  
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n=== Connection Successful ===");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.println("Please use this IP in your Flutter app");
+    Serial.println("The IP will remain constant as long as you use the same phone hotspot");
+    server.begin();
+    Serial.println("Server started and ready to accept connections");
+    Serial.println("================================\n");
+  } else {
+    Serial.println("\n=== Connection Failed ===");
+    Serial.print("WiFi Status: ");
+    Serial.println(WiFi.status());
+    Serial.println("Please check your hotspot settings and try again");
+    Serial.println("================================\n");
+  }
+}
+
+void loop() {
+  static unsigned long lastSensorRead = 0;
+  static unsigned long lastWiFiCheck = 0;
+  static unsigned long lastDebugTime = 0;
+  static unsigned long lastBroadcastTime = 0;
+  
+  // Debug output every 5 seconds
+  if (millis() - lastDebugTime >= 5000) {
+    lastDebugTime = millis();
+    Serial.println("\n=== Debug Info ===");
+    Serial.print("WiFi Status: ");
+    Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+    Serial.print("Server Available: ");
+    Serial.println(server.available() ? "Yes" : "No");
+    Serial.print("Last JSON Data: ");
+    Serial.println(lastJsonData.length() > 0 ? "Available" : "None");
+    Serial.print("Showing Cloud: ");
+    Serial.println(showingCloud ? "Yes" : "No");
+    Serial.println("==================\n");
+  }
+  
+  // Check WiFi connection periodically
+  if (millis() - lastWiFiCheck >= 30000) { // Check every 30 seconds
+    lastWiFiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi connection lost. Attempting to reconnect...");
+      reconnectWiFi();
+    }
+  }
+  
+  // Handle LED matrix states
+  if (showingCloud && millis() - cloudDisplayTime > 1000) {
+    showingCloud = false;
+    matrix.clear();
+  }
+  
+  if (readingsActive && !showingCloud) {
+    if (millis() - previousBlinkTime >= 500) {
+      previousBlinkTime = millis();
+      heartOn = !heartOn;
+      heartOn ? matrix.loadFrame(heart) : matrix.clear();
+    }
+  }
+  
+  // Check for client connections
+  WiFiClient client = server.available();
+  if (client) {
+    Serial.println("New client connected");
+    showCloudAnimation();
+    handleClient(client);
+  }
+  
+  // Read sensors every second
+  if (millis() - lastSensorRead >= 1000) {
+    lastSensorRead = millis();
+
+    // Current readings
+    int bpm = 0;
+    float temp = 0.0;
+    int syst = 0, diast = 0, bpPulse = 0;
+
+    // Read pulse sensor
+    int pulseValue = analogRead(pulsePin);
+    Serial.print("Raw Pulse Value: ");
+    Serial.println(pulseValue);
+    
+    if (pulseValue > pulseThreshold && pulseValue < pulseMax) {
+      int rawBPM = map(pulseValue, 200, 800, 40, 120);
+      bpm = smoothBPM(rawBPM);
+      Serial.print("Calculated BPM: ");
+      Serial.println(bpm);
+    }
+
+    // Read temperature
+    tempSensor.requestTemperatures();
+    temp = tempSensor.getTempCByIndex(0);
+    Serial.print("Temperature: ");
+    Serial.println(temp);
+
+    // Read BP sensor
+    if (BP_SERIAL.available()) {
+      String bpData = BP_SERIAL.readStringUntil('\n');
+      Serial.print("Raw BP Data: ");
+      Serial.println(bpData);
+      
+      parseBPData(bpData, syst, diast, bpPulse);
+      Serial.print("BP Data - Systolic: ");
+      Serial.print(syst);
+      Serial.print(", Diastolic: ");
+      Serial.println(diast);
+    }
+
+    // Check if readings have changed
+    bool bpmChanged = abs(bpm - prevBPM) >= BPM_THRESHOLD;
+    bool tempChanged = abs(temp - prevTemp) >= TEMP_THRESHOLD;
+    bool systChanged = abs(syst - prevSyst) >= BP_THRESHOLD;
+    bool diastChanged = abs(diast - prevDiast) >= BP_THRESHOLD;
+    bool bpPulseChanged = abs(bpPulse - prevBPPulse) >= BP_THRESHOLD;
+
+    readingsActive = bpmChanged || tempChanged || systChanged || diastChanged || bpPulseChanged;
+    
+    if (readingsActive) {
+      Serial.println("Readings have changed - showing heart animation");
+      showHeartAnimation();
+    }
+
+    // Update previous readings
+    prevBPM = bpm;
+    prevTemp = temp;
+    prevSyst = syst;
+    prevDiast = diast;
+    prevBPPulse = bpPulse;
+
+    // Always create JSON data regardless of BP readings
+    String jsonData = String("{") +
+      "\"bpm\":" + String(bpm) + "," +
+      "\"temp\":" + String(temp, 4) + "," +
+      "\"systolic\":" + String(syst) + "," +
+      "\"diastolic\":" + String(diast) + "," +
+      "\"bp_pulse\":" + String(bpPulse) +
+      "}";
+    
+    Serial.print("Created JSON data: ");
+    Serial.println(jsonData);
+
+    // Store the JSON data for transmission
+    lastJsonData = jsonData;
+  }
+  
+  // Broadcast data every 5 seconds regardless of readings
+  if (lastJsonData.length() > 0 && millis() - lastBroadcastTime >= 1000) {
+    lastBroadcastTime = millis();
+    Serial.println("Scheduled broadcast - sending data every 1 seconds");
+    broadcastData();
+  }
+  
+  delay(100);
+}
+
+void broadcastData() {
+  if (lastJsonData.length() > 0) {
+    // Show cloud when transmitting
+    showCloudAnimation();
+    
+    // Try to send data to any available clients
+    WiFiClient client = server.available();
+    if (client) {
+      Serial.println("Client available for broadcasting");
+      
+      // First transmission
+      sendDataToClient(client, lastJsonData);
+      Serial.println("First broadcast transmission complete");
+      
+      // Wait and try second transmission
+      delay(500);
+      client = server.available();
+      if (client) {
+        Serial.println("Sending data second time");
+        sendDataToClient(client, lastJsonData);
+      }
+      
+      // Wait and try third transmission
+      delay(500);
+      client = server.available();
+      if (client) {
+        Serial.println("Sending data third time");
+        sendDataToClient(client, lastJsonData);
+      }
+      
+      // Wait and try fourth transmission
+      delay(500);
+      client = server.available();
+      if (client) {
+        Serial.println("Sending data fourth time");
+        sendDataToClient(client, lastJsonData);
+      }
+    } else {
+      Serial.println("No clients available for broadcasting");
+    }
+  }
+}
+
+void showCloudAnimation() {
+  matrix.loadFrame(cloud);
+  showingCloud = true;
+  cloudDisplayTime = millis();
+  Serial.println("Cloud animation started");
+}
+
+void showHeartAnimation() {
+  matrix.loadFrame(heart);
+  heartOn = true;
+  previousBlinkTime = millis();
+  Serial.println("Heart animation started");
+}
+
+void handleClient(WiFiClient &client) {
+  // Read the first line of the request
+  String currentLine = "";
+  while (client.connected()) {
+    if (client.available()) {
+      char c = client.read();
+      if (c == '\n') {
+        if (currentLine.length() == 0) {
+          // End of headers
+          break;
+        } else {
+          currentLine = "";
+        }
+      } else if (c != '\r') {
+        currentLine += c;
+      }
+    }
+  }
+  
+  Serial.print("Received request: ");
+  Serial.println(currentLine);
+  
+  // Check if this is a discovery request
+  if (currentLine.indexOf("GET /discover") >= 0) {
+    // Send discovery response
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Access-Control-Allow-Origin: *");
+    client.println("Connection: close");
+    client.println();
+    client.println("{\"device\":\"arduino\",\"type\":\"sensor\",\"name\":\"BP Monitor\"}");
+    client.stop();
+    Serial.println("Discovery request handled");
+    return;
+  }
+  
+  // Regular data request
+  if (currentLine.indexOf("GET /") >= 0) {
+    // Send the latest sensor data
+    String jsonData = String("{") +
+      "\"bpm\":" + String(prevBPM) + "," +
+      "\"temp\":" + String(prevTemp, 4) + "," +
+      "\"systolic\":" + String(prevSyst) + "," +
+      "\"diastolic\":" + String(prevDiast) + "," +
+      "\"bp_pulse\":" + String(prevBPPulse) +
+      "}";
+    
+    sendDataToClient(client, jsonData);
+  }
+}
+
+void sendDataToClient(WiFiClient &client, const String &jsonData) {
+  // Send HTTP headers
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Access-Control-Allow-Origin: *");
+  client.println("Connection: keep-alive");
+  client.println("Content-Length: " + String(jsonData.length()));
+  client.println();
+  
+  // Send JSON data
+  client.println(jsonData);
+  
+  // Keep connection open for a short time
+  delay(100);
+  client.stop();
+  Serial.println("Data sent and client disconnected");
+}
+
+void parseBPData(String data, int &syst, int &diast, int &pulse) {
+  data.trim();
+  int firstComma = data.indexOf(',');
+  int secondComma = data.indexOf(',', firstComma + 1);
+  int thirdComma = data.indexOf(',', secondComma + 1);
+
+  if (firstComma != -1 && secondComma != -1 && thirdComma != -1) {
+    String s_syst = data.substring(firstComma + 1, secondComma);
+    String s_diast = data.substring(secondComma + 1, thirdComma);
+    String s_pulse = data.substring(thirdComma + 1);
+
+    s_syst.trim();
+    s_diast.trim();
+    s_pulse.trim();
+
+    syst = s_syst.toInt();
+    diast = s_diast.toInt();
+    pulse = s_pulse.toInt();
+  } else {
+    syst = diast = pulse = 0;
+  }
+}
+
+int smoothBPM(int rawBPM) {
+  readings[readIndex] = rawBPM;
+  readIndex = (readIndex + 1) % numReadings;
+  long sum = 0;
+  for (int i = 0; i < numReadings; i++) sum += readings[i];
+  return sum / numReadings;
+}
