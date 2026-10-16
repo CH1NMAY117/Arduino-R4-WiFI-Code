@@ -51,6 +51,6 @@ Built by Team Clinovators for the *Product Design & Prototyping Laboratory* cour
 
 Thanks to Dr. Erwin Fuhrer, Dr. Subrata Pramanik, Prof. Subramani Kanagaraj and teaching assistants Sheetal Das and Vishal Tande for their mentorship.
 
-## Licence
+## License
 
 [MIT](LICENSE)
