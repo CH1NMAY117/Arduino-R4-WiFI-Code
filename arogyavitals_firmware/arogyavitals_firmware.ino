@@ -4,8 +4,8 @@
 #include <WiFiS3.h>
 
 // WiFi Configuration
-char ssid[] = "realme 7";     // Your phone's hotspot name
-char pass[] = "g5qeemg4";    // Your phone's hotspot password
+char ssid[] = "YOUR_WIFI_SSID";          // Wi-Fi / phone hotspot name
+char pass[] = "YOUR_WIFI_PASSWORD";      // Wi-Fi / phone hotspot password
 WiFiServer server(80);
 
 // Pin assignments
