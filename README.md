@@ -37,6 +37,7 @@ Built by Team Clinovators for the *Product Design & Prototyping Laboratory* cour
 
 ## Limitations
 
+- The live connection from a phone app to this firmware was demonstrated with a separate companion app that is not published here. The [MitraLink](https://github.com/CH1NMAY117/mitralink) interface does not yet include it.
 - Heart rate (`bpm`) is a rough estimate: the raw analog pulse value is mapped linearly to 40–120 and smoothed with a moving average. It is not a validated beat-detection algorithm.
 - Blood pressure comes from an external module; the firmware only parses its serial output (expected as comma-separated values, with systolic, diastolic and pulse in fields 2 to 4).
 - The server is unauthenticated and sends data in plain HTTP, so it is suitable only for local prototyping.
